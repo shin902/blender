@@ -128,6 +128,64 @@ def _latlon_to_tile_frac(lat_deg: float, lon_deg: float, zoom: int) -> tuple[flo
     return frac_x, frac_y
 
 
+def _compute_inset_transform(
+    inset_polys_xy: "list[list[tuple[float, float]]]",
+    cam_x: float,
+    cam_y: float,
+    ortho_scale: float,
+    aspect: float,
+    box_x_frac: "tuple[float, float]" = (0.02, 0.24),
+    box_y_frac: "tuple[float, float]" = (0.62, 1.0),
+    src_padding: float = 0.12,
+    dst_padding: float = 0.05,
+) -> "tuple[list[list[tuple[float, float]]], tuple[float, float, float, float]]":
+    """インセット用ポリゴンをビュー左上の小枠内座標に変換する。
+
+    Returns:
+        (変換済みポリゴンリスト, (box_x0, box_y0, box_x1, box_y1)) のタプル。
+    """
+    view_w = ortho_scale
+    view_h = ortho_scale / aspect
+    view_x0 = cam_x - view_w / 2
+    view_y0 = cam_y - view_h / 2
+
+    # インセット枠のワールド座標
+    box_x0 = view_x0 + box_x_frac[0] * view_w
+    box_x1 = view_x0 + box_x_frac[1] * view_w
+    box_y0 = view_y0 + box_y_frac[0] * view_h
+    box_y1 = view_y0 + box_y_frac[1] * view_h
+
+    # ソースポリゴンの範囲
+    all_pts = [pt for poly in inset_polys_xy for pt in poly]
+    src_x0 = min(p[0] for p in all_pts)
+    src_x1 = max(p[0] for p in all_pts)
+    src_y0 = min(p[1] for p in all_pts)
+    src_y1 = max(p[1] for p in all_pts)
+    px = (src_x1 - src_x0) * src_padding
+    py = (src_y1 - src_y0) * src_padding
+    src_x0 -= px; src_x1 += px
+    src_y0 -= py; src_y1 += py
+
+    # ソースのアスペクト比を保ったまま枠内に収める
+    src_w = src_x1 - src_x0
+    src_h = src_y1 - src_y0
+    dst_w = (box_x1 - box_x0) * (1 - 2 * dst_padding)
+    dst_h = (box_y1 - box_y0) * (1 - 2 * dst_padding)
+    scale = min(dst_w / src_w, dst_h / src_h)
+    actual_w = src_w * scale
+    actual_h = src_h * scale
+    # 枠内で中央寄せ
+    offset_x = box_x0 + (box_x1 - box_x0 - actual_w) / 2
+    offset_y = box_y0 + (box_y1 - box_y0 - actual_h) / 2
+
+    def _t(x: float, y: float) -> "tuple[float, float]":
+        tx = offset_x + (x - src_x0) * scale
+        ty = offset_y + (y - src_y0) * scale
+        return (tx, ty)
+
+    transformed = [[_t(x, y) for x, y in poly] for poly in inset_polys_xy]
+    return transformed, (box_x0, box_y0, box_x1, box_y1)
+
 
 def _fetch_tile(url: str, headers: dict) -> "Image.Image | None":
     """タイルを URL からダウンロードして PIL Image を返す。失敗時は None。"""
@@ -737,10 +795,15 @@ def generate_japan_map_script(
     samples: int = 64,
     camera_location: tuple[float, float, float] = (0.0, 0.0, 22.0),
     camera_rotation: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    camera_type: str = "ORTHO",
+    camera_lens: float = 35.0,
+    ortho_zoom: float = 1.0,
     background_color: tuple[float, float, float, float] = (0.04, 0.07, 0.14, 1.0),
     ocean_color: tuple[float, float, float] = (0.04, 0.18, 0.42),
     land_color: tuple[float, float, float] = (0.28, 0.42, 0.20),
     texture_path: "Path | None" = None,
+    inset_polys_xy: "list[list[tuple[float, float]]] | None" = None,
+    inset_border: "tuple[float, float, float, float] | None" = None,
 ) -> str:
     """地形データ（GeoJSON ポリゴン）だけを Blender でレンダリングする bpy スクリプトを生成する。
 
@@ -782,8 +845,9 @@ def generate_japan_map_script(
     # bbox 高さ (PLANE_SIZE) を完全に表示するには:
     #   ortho_scale ≥ PLANE_SIZE × (res_x / res_y)
     _aspect = resolution_x / resolution_y
-    _ortho = PLANE_SIZE * _aspect * 1.05   # 5% パディング
-    _ocean_size = _ortho * 1.3             # カメラ幅を完全にカバー
+    _ortho = PLANE_SIZE * _aspect * 1.05 * ortho_zoom   # 5% パディング、ortho_zoom < 1 でズームイン
+    # PERSP 時は低角度で地平線まで見えるため海プレーンを大きくする
+    _ocean_size = _ortho * (4.0 if camera_type == "PERSP" else 1.3)
 
     lines = [
         "import bpy",
@@ -876,10 +940,14 @@ def generate_japan_map_script(
         ]
 
     lines += [
-        "# ── カメラ（真上俯瞰・直交投影）─────────────────────────────────",
+        "# ── カメラ ───────────────────────────────────────────────────────",
         "cam_data = bpy.data.cameras.new('Camera')",
-        "cam_data.type = 'ORTHO'",
-        f"cam_data.ortho_scale = {_ortho:.4f}",
+        f"cam_data.type = {camera_type!r}",
+        *(
+            [f"cam_data.ortho_scale = {_ortho:.4f}"]
+            if camera_type == "ORTHO"
+            else [f"cam_data.lens = {camera_lens}"]
+        ),
         "cam_obj = bpy.data.objects.new('Camera', cam_data)",
         "bpy.context.scene.collection.objects.link(cam_obj)",
         f"cam_obj.location = {camera_location}",
@@ -922,14 +990,19 @@ def render_japan_map(
     geojson_cache: Path | None = None,
     rdp_epsilon: float = 0.05,
     min_bbox_area: float = 0.01,
-    camera_location: tuple[float, float, float] = (0.0, 0.0, 22.0),
+    camera_location: tuple[float, float, float] = (-1.14, 0.66, 22.0),
     camera_rotation: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    camera_type: str = "ORTHO",
+    camera_lens: float = 35.0,
+    ortho_zoom: float = 0.86,
     background_color: tuple[float, float, float, float] = (0.04, 0.07, 0.14, 1.0),
     ocean_color: tuple[float, float, float] = (0.04, 0.18, 0.42),
     land_color: tuple[float, float, float] = (0.28, 0.42, 0.20),
     tile_zoom: int = 5,
     tile_source: "str | None" = "std",
     force_tile_refresh: bool = False,
+    use_inset: bool = True,
+    inset_lat_cutoff: float = 31.5,
 ) -> dict[str, Any]:
     """地形データのみを Blender でレンダリングして PNG を生成する。
 
@@ -985,6 +1058,9 @@ def render_japan_map(
         samples=samples,
         camera_location=camera_location,
         camera_rotation=camera_rotation,
+        camera_type=camera_type,
+        camera_lens=camera_lens,
+        ortho_zoom=ortho_zoom,
         background_color=background_color,
         ocean_color=ocean_color,
         land_color=land_color,

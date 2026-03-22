@@ -22,11 +22,13 @@ _GSI_GEOJSON_URL = (
 )
 _GEOJSON_CACHE = Path.home() / ".cache" / "cli-anything-blender" / "japan.geojson"
 
-# 国土地理院 シームレス航空写真タイル
-_TILE_URL = "https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg"
-# フォールバック: ESRI World Imagery（APIキー不要）
-# 注: ESRI は {z}/{y}/{x} の順番
-_TILE_URL_FALLBACK = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+# タイルソース定義
+_TILE_SOURCES = {
+    "std": "https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png",
+    "pale": "https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",
+    "relief": "https://cyberjapandata.gsi.go.jp/xyz/relief/{z}/{x}/{y}.png",
+    "photo": "https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg",
+}
 _TILE_CACHE = Path.home() / ".cache" / "cli-anything-blender" / "tiles"
 
 
@@ -126,28 +128,6 @@ def _latlon_to_tile_frac(lat_deg: float, lon_deg: float, zoom: int) -> tuple[flo
     return frac_x, frac_y
 
 
-def _is_gray_tile(tile: "Image.Image") -> bool:
-    """タイルがグレー（雲・モザイクつなぎ目など低品質）かどうかを判定する。
-
-    2つの基準:
-    1. 低彩度 (R≈G≈B) かつ中間輝度 → 典型的なグレーモザイク
-    2. 低彩度 + 低分散 → 均一な低品質タイル（やや色味があっても）
-    """
-    from PIL import ImageStat
-    stat = ImageStat.Stat(tile)
-    r, g, b = stat.mean
-    max_diff = max(abs(r - g), abs(g - b), abs(r - b))
-    avg_std = sum(stat.stddev) / 3
-    avg_lum = (r + g + b) / 3
-
-    # 純粋グレー: 低彩度 + 中間輝度
-    if max_diff < 12 and 25 < avg_lum < 200:
-        return True
-    # 均一な低品質タイル: やや彩度あるが分散が極端に低い
-    if max_diff < 18 and avg_std < 12 and 20 < avg_lum < 200:
-        return True
-    return False
-
 
 def _fetch_tile(url: str, headers: dict) -> "Image.Image | None":
     """タイルを URL からダウンロードして PIL Image を返す。失敗時は None。"""
@@ -161,62 +141,19 @@ def _fetch_tile(url: str, headers: dict) -> "Image.Image | None":
         return None
 
 
-def _fill_gray_with_neighbor_avg(
-    canvas: "Image.Image",
-    gray_positions: "list[tuple[int, int]]",
-    tile_w: int,
-    tile_h: int,
-    px: int,
-) -> None:
-    """グレータイル領域を隣接タイルの境界ピクセル平均色で塗りつぶす（in-place）。"""
-    from PIL import ImageStat, Image
-
-    for ix, iy in gray_positions:
-        # 隣接タイルの接する辺からサンプルを取る
-        samples_r, samples_g, samples_b = [], [], []
-        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            nx, ny = ix + dx, iy + dy
-            if 0 <= nx < tile_w and 0 <= ny < tile_h and (nx, ny) not in gray_positions:
-                # 隣接タイルの境界ライン（2px 幅）をサンプル
-                if dx == -1:  # 左隣の右辺
-                    strip = canvas.crop((nx * px + px - 2, ny * px, nx * px + px, ny * px + px))
-                elif dx == 1:  # 右隣の左辺
-                    strip = canvas.crop((nx * px, ny * px, nx * px + 2, ny * px + px))
-                elif dy == -1:  # 上隣の下辺
-                    strip = canvas.crop((nx * px, ny * px + px - 2, nx * px + px, ny * px + px))
-                else:  # 下隣の上辺
-                    strip = canvas.crop((nx * px, ny * px, nx * px + px, ny * px + 2))
-                stat = ImageStat.Stat(strip)
-                samples_r.append(stat.mean[0])
-                samples_g.append(stat.mean[1])
-                samples_b.append(stat.mean[2])
-
-        if samples_r:
-            avg_color = (
-                int(sum(samples_r) / len(samples_r)),
-                int(sum(samples_g) / len(samples_g)),
-                int(sum(samples_b) / len(samples_b)),
-            )
-        else:
-            avg_color = (6, 46, 106)  # 海の青
-
-        fill = Image.new("RGB", (px, px), avg_color)
-        canvas.paste(fill, (ix * px, iy * px))
-
-
-def fetch_gsi_aerial_texture(
+def fetch_map_texture(
     zoom: int = 6,
+    tile_source: str = "std",
     cache_path: "Path | None" = None,
     force_refresh: bool = False,
 ) -> Path:
-    """国土地理院 seamlessphoto タイルをダウンロード・スティッチして Japan bbox にクロップした JPEG を返す。
+    """国土地理院タイルをダウンロード・スティッチして Japan bbox にクロップした JPEG を返す。
 
-    グレー（雲・モザイクつなぎ目）と判定されたタイルは ESRI World Imagery から
-    代替取得し、隣接 GSI タイルの色調にマッチングして継ぎ目を軽減する。
     初回のみダウンロード、2回目以降はキャッシュを返す。
 
     Args:
         zoom: ズームレベル（デフォルト 6）。
+        tile_source: タイルソース ("std", "pale", "photo")。
         cache_path: キャッシュ保存先パス。省略時はデフォルトキャッシュディレクトリ。
         force_refresh: True の場合キャッシュを無視して再ダウンロード。
 
@@ -225,9 +162,13 @@ def fetch_gsi_aerial_texture(
     """
     from PIL import Image
 
-    cache_file = Path(cache_path or _TILE_CACHE / f"japan_aerial_z{zoom}.jpg")
+    if tile_source not in _TILE_SOURCES:
+        raise ValueError(f"Unknown tile_source: {tile_source!r}. Choose from {list(_TILE_SOURCES)}")
+
+    url_template = _TILE_SOURCES[tile_source]
+    cache_file = Path(cache_path or _TILE_CACHE / f"japan_{tile_source}_z{zoom}.jpg")
     if cache_file.exists() and not force_refresh:
-        print(f"航空写真キャッシュ使用: {cache_file}")
+        print(f"タイルキャッシュ使用: {cache_file}")
         return cache_file
 
     cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -242,48 +183,13 @@ def fetch_gsi_aerial_texture(
 
     headers = {"User-Agent": "cli-anything-blender/1.0"}
 
-    # === Pass 1: 全 GSI タイルを取得 → キャンバスに貼り付け、グレー位置を記録 ===
     canvas = Image.new("RGB", (tile_w * px, tile_h * px), (6, 46, 106))
-    gray_set: set[tuple[int, int]] = set()
 
     for ix, tx in enumerate(range(x_min, x_max + 1)):
         for iy, ty in enumerate(range(y_min, y_max + 1)):
-            tile = _fetch_tile(_TILE_URL.format(z=zoom, x=tx, y=ty), headers)
+            tile = _fetch_tile(url_template.format(z=zoom, x=tx, y=ty), headers)
             if tile is not None:
-                if _is_gray_tile(tile):
-                    gray_set.add((ix, iy))
-                    # グレーでも一旦貼り付ける（後で上書き）
                 canvas.paste(tile, (ix * px, iy * px))
-
-    # === Pass 2: グレータイルを隣接タイルの境界色平均で塗りつぶし ===
-    if gray_set:
-        _fill_gray_with_neighbor_avg(canvas, list(gray_set), tile_w, tile_h, px)
-        print(f"グレータイル検出: {len(gray_set)} 枚 → 隣接色で塗りつぶし")
-
-    # === Pass 3: 全タイル境界にシームブレンディング（ガウシアンブラー） ===
-    from PIL import ImageFilter, ImageDraw
-
-    seam_w = 12  # ブレンド幅（px）
-    mask = Image.new("L", canvas.size, 0)
-    draw = ImageDraw.Draw(mask)
-    # 縦のシーム
-    for ix in range(1, tile_w):
-        x = ix * px
-        draw.rectangle([x - seam_w, 0, x + seam_w, canvas.height], fill=255)
-    # 横のシーム
-    for iy in range(1, tile_h):
-        y = iy * px
-        draw.rectangle([0, y - seam_w, canvas.width, y + seam_w], fill=255)
-    # グレータイル全体もブレンド対象
-    for ix, iy in gray_set:
-        draw.rectangle([ix * px, iy * px, (ix + 1) * px, (iy + 1) * px], fill=255)
-
-    # マスクをぼかして自然なフォールオフにする
-    mask = mask.filter(ImageFilter.GaussianBlur(radius=seam_w * 2))
-    # キャンバスのブラー版を作成
-    blurred = canvas.filter(ImageFilter.GaussianBlur(radius=seam_w * 3))
-    # 合成: マスク白部分はブラー版、黒部分はオリジナル
-    canvas = Image.composite(blurred, canvas, mask)
 
     # Mercator ピクセル座標で bbox にクロップ
     frac_x_left, frac_y_top = _latlon_to_tile_frac(JAPAN_MAX_LAT, JAPAN_MIN_LON, zoom)
@@ -294,7 +200,7 @@ def fetch_gsi_aerial_texture(
     crop_y1 = min(canvas.height, int((frac_y_bottom - y_min) * px))
     canvas = canvas.crop((crop_x0, crop_y0, crop_x1, crop_y1))
     canvas.save(cache_file, "JPEG", quality=90)
-    print(f"航空写真テクスチャ保存: {cache_file} ({canvas.width}x{canvas.height}px)")
+    print(f"地図テクスチャ保存: {cache_file} ({canvas.width}x{canvas.height}px)")
     return cache_file
 
 
@@ -1021,16 +927,15 @@ def render_japan_map(
     background_color: tuple[float, float, float, float] = (0.04, 0.07, 0.14, 1.0),
     ocean_color: tuple[float, float, float] = (0.04, 0.18, 0.42),
     land_color: tuple[float, float, float] = (0.28, 0.42, 0.20),
-    use_aerial_texture: bool = True,
     tile_zoom: int = 5,
+    tile_source: "str | None" = "std",
     force_tile_refresh: bool = False,
 ) -> dict[str, Any]:
     """地形データのみを Blender でレンダリングして PNG を生成する。
 
     CSV や降水量データは使用しない。国土数値情報 N03 GeoJSON を
     ダウンロード（初回のみ）して Japan の陸地形状を正確に描画する。
-    use_aerial_texture=True（デフォルト）の場合、国土地理院 seamlessphoto タイルを
-    ベースマップとして使用する。
+    tile_source で指定した国土地理院タイルをベースマップとして使用する。
 
     Args:
         output_path: 出力 PNG パス。
@@ -1045,10 +950,10 @@ def render_japan_map(
         camera_location: カメラ位置。
         camera_rotation: カメラ回転（Euler rad）。
         background_color: ワールド背景 RGBA。
-        ocean_color: 海の RGB（use_aerial_texture=False 時）。
-        land_color: 陸地の RGB（use_aerial_texture=False 時）。
-        use_aerial_texture: True の場合、GSI 航空写真をベースマップに使用。
-        tile_zoom: 航空写真タイルのズームレベル（デフォルト 6）。
+        ocean_color: 海の RGB（テクスチャ未使用時）。
+        land_color: 陸地の RGB（テクスチャ未使用時）。
+        tile_zoom: タイルのズームレベル（デフォルト 5）。
+        tile_source: タイルソース ("std", "pale", "relief", "photo")。None で2色ポリゴン描画。
         force_tile_refresh: True の場合、タイルキャッシュを再ダウンロード。
 
     Returns:
@@ -1064,10 +969,12 @@ def render_japan_map(
     )
     print(f"陸地ポリゴン数: {len(land_polygons)}")
 
-    # 航空写真テクスチャ取得
+    # 地図テクスチャ取得（tile_source=None なら2色ポリゴン描画）
     texture_path = None
-    if use_aerial_texture:
-        texture_path = fetch_gsi_aerial_texture(zoom=tile_zoom, force_refresh=force_tile_refresh)
+    if tile_source is not None:
+        texture_path = fetch_map_texture(
+            zoom=tile_zoom, tile_source=tile_source, force_refresh=force_tile_refresh
+        )
 
     script = generate_japan_map_script(
         land_polygons=land_polygons,

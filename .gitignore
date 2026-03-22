@@ -4,4 +4,4 @@ null
 __pycache__/
 *.pyc
 *.egg-info/
-to-be.JPG
+*.jpg

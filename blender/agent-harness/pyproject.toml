@@ -1,0 +1,24 @@
+[project]
+name = "cli-anything-blender"
+version = "1.0.0"
+description = "CLI harness for Blender 3D automation — part of the cli-anything suite"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.0",
+    "prompt-toolkit>=3.0",
+    "Pillow>=10.0",
+]
+
+[project.scripts]
+cli-anything-blender = "cli_anything.blender.blender_cli:cli"
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["cli_anything.*"]
+
+[tool.setuptools.package-data]
+"cli_anything.blender" = ["skills/*.md"]
